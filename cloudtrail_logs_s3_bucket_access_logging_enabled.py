@@ -56,8 +56,11 @@ def get_regions(session):
 # HELPERS
 # ==================================================
 def classify_error(e):
-    """Map a ClientError to a short, human-readable reason."""
+    """Map a ClientError to a short, human-readable reason.
+    Always appends the raw AWS error code/message so root cause is visible
+    in the CSV instead of being collapsed into a generic bucket."""
     code = e.response.get("Error", {}).get("Code", "Unknown")
+    raw_message = e.response.get("Error", {}).get("Message", str(e))
     reasons = {
         "AccessDeniedException": "Access denied - insufficient IAM permissions",
         "AccessDenied": "Access denied - insufficient IAM permissions",
@@ -66,7 +69,8 @@ def classify_error(e):
         "TrailNotFoundException": "Trail not found (may have been deleted)",
         "NoSuchBucket": "Destination S3 bucket no longer exists",
     }
-    return code, reasons.get(code, f"AWS error ({code})")
+    friendly = reasons.get(code, f"AWS error ({code})")
+    return code, f"{friendly} | raw: {code}: {raw_message}"
 
 
 def resolve_bucket_region(session, bucket_name):
@@ -97,6 +101,11 @@ def check_bucket_logging(session, bucket_name, cache):
     except ClientError as e:
         _, reason = classify_error(e)
         result = ("SKIPPED", f"Could not check logging on bucket '{bucket_name}': {reason}")
+    except Exception as e:
+        # Catch-all so unexpected errors (endpoint issues, param validation,
+        # etc.) don't crash the run or get silently swallowed - they show up
+        # in the CSV instead.
+        result = ("SKIPPED", f"Could not check logging on bucket '{bucket_name}': Unexpected error: {type(e).__name__}: {e}")
 
     cache[bucket_name] = result
     return result
@@ -240,6 +249,16 @@ def main():
     print(f"Overall       : {overall}")
     print(f"CSV Report    : {csv_file}")
     print("=" * 60)
+
+    # Print skipped rows straight to console too, so the root cause is
+    # visible immediately without having to open the CSV.
+    skipped_rows = [r for r in results if r["Status"] == "SKIPPED"]
+    if skipped_rows:
+        print("\nSKIPPED DETAILS:")
+        print("-" * 60)
+        for r in skipped_rows:
+            print(f"[{r['Region']}] {r['TrailName']}: {r['Evidence']}")
+        print("-" * 60)
 
 
 if __name__ == "__main__":
