@@ -10,8 +10,14 @@ are checked for full read+write coverage of Management events:
   - Advanced: a selector targeting eventCategory=Management with no readOnly
     restriction (covers both), or both readOnly=true and readOnly=false
     present across selectors.
-Multi-region trails are only evaluated once, in their HomeRegion, to avoid
-double-counting.
+
+Multi-region trails apply their logging configuration to every region in
+the account, so - to match how they're reported by GRC/compliance tooling -
+a multi-region trail is evaluated ONCE (in its HomeRegion, where
+get_event_selectors is called), and that same result is then recorded for
+every region it is visible in. This produces one result row per region per
+trail, matching resource-per-region reporting conventions, while only
+making the AWS API call once per trail.
 """
 
 import argparse
@@ -63,8 +69,10 @@ def get_regions(session):
 # HELPERS
 # ==================================================
 def classify_error(e):
-    """Map a ClientError to a short, human-readable reason."""
+    """Map a ClientError to a short, human-readable reason, with the raw
+    AWS error code/message appended so root cause is visible in the CSV."""
     code = e.response.get("Error", {}).get("Code", "Unknown")
+    raw_message = e.response.get("Error", {}).get("Message", str(e))
     reasons = {
         "AccessDeniedException": "Access denied - insufficient IAM permissions",
         "AccessDenied": "Access denied - insufficient IAM permissions",
@@ -72,7 +80,8 @@ def classify_error(e):
         "InvalidClientTokenId": "Invalid/expired credentials for this region",
         "TrailNotFoundException": "Trail not found (may have been deleted)",
     }
-    return code, reasons.get(code, f"AWS error ({code})")
+    friendly = reasons.get(code, f"AWS error ({code})")
+    return code, f"{friendly} | raw: {code}: {raw_message}"
 
 
 def evaluate_advanced_selectors(advanced_selectors):
@@ -143,6 +152,14 @@ def check_control(session, account_id, regions):
     non_compliant = 0
     skipped = 0
 
+    # Cache of trail_arn -> (status, evidence, is_multi_region, home_region)
+    # so a multi-region trail's event selectors are only fetched from AWS
+    # once, even though its result gets recorded once per region below.
+    trail_eval_cache = {}
+    # Track (region, trail_arn) pairs we've already appended to results,
+    # in case list_trails ever returns duplicates within the same region.
+    seen_region_trail = set()
+
     print(f"\nRegions to Scan: {len(regions)}\n")
 
     for region in tqdm(regions, desc="Scanning Regions"):
@@ -168,6 +185,10 @@ def check_control(session, account_id, regions):
             continue
 
         for trail_arn in tqdm(trail_arns, desc=f"  {region}", leave=False):
+            if (region, trail_arn) in seen_region_trail:
+                continue
+            seen_region_trail.add((region, trail_arn))
+
             try:
                 trail_info = client.get_trail(Name=trail_arn)["Trail"]
             except ClientError as e:
@@ -179,31 +200,39 @@ def check_control(session, account_id, regions):
                 })
                 continue
 
+            trail_name = trail_info.get("Name", "N/A")
             home_region = trail_info.get("HomeRegion")
-            if home_region and home_region != region:
-                # Multi-region trail surfaced from a non-home region - evaluated
-                # once already (or will be) in its home region, skip here entirely.
-                continue
+            is_multi_region = bool(trail_info.get("IsMultiRegionTrail"))
+
+            # Evaluate the trail's event selectors once (cached per trail_arn).
+            # For a multi-region trail this call is made against its
+            # HomeRegion client the first time it's encountered; the cached
+            # result is then reused for every other region it appears in.
+            if trail_arn not in trail_eval_cache:
+                try:
+                    status, evidence = evaluate_trail_event_selectors(client, trail_arn)
+                except ClientError as e:
+                    _, reason = classify_error(e)
+                    status, evidence = "SKIPPED", f"Could not fetch event selectors: {reason}"
+                except Exception as e:
+                    status, evidence = "SKIPPED", f"Could not evaluate trail: {e}"
+                trail_eval_cache[trail_arn] = (status, evidence)
+            else:
+                status, evidence = trail_eval_cache[trail_arn]
+
+            # Annotate evidence with multi-region / home-region context so
+            # rows for the same trail read consistently across every region,
+            # matching how multi-region trails are reported in region-scoped
+            # compliance inventories.
+            if is_multi_region and home_region:
+                evidence = f"Trail '{trail_name}' from home region {home_region} is multi-region. {evidence}"
 
             total_checked += 1
-            trail_name = trail_info.get("Name", "N/A")
-
-            try:
-                status, evidence = evaluate_trail_event_selectors(client, trail_arn)
-                if status == "COMPLIANT":
-                    compliant += 1
-                elif status == "NON_COMPLIANT":
-                    non_compliant += 1
-                else:
-                    skipped += 1
-            except ClientError as e:
-                _, reason = classify_error(e)
-                status = "SKIPPED"
-                evidence = f"Could not fetch event selectors: {reason}"
-                skipped += 1
-            except Exception as e:
-                status = "SKIPPED"
-                evidence = f"Could not evaluate trail: {e}"
+            if status == "COMPLIANT":
+                compliant += 1
+            elif status == "NON_COMPLIANT":
+                non_compliant += 1
+            else:
                 skipped += 1
 
             results.append({
@@ -236,12 +265,19 @@ def write_csv(results, account_id):
 def main():
     parser = argparse.ArgumentParser(description=CONTROL_NAME)
     parser.add_argument("-R", "--role-arn", help="IAM role ARN to assume", default=None)
+    parser.add_argument(
+        "--region",
+        help="Only scan this region (e.g. ap-south-1) instead of all enabled regions. "
+             "Multi-region trails still show up here if AWS's list_trails "
+             "surfaces them in this region.",
+        default=None,
+    )
     args = parser.parse_args()
 
     try:
         session = get_session(args.role_arn)
         account_id = get_account_id(session)
-        regions = get_regions(session)
+        regions = [args.region] if args.region else get_regions(session)
     except (ClientError, NoCredentialsError) as e:
         print(f"FATAL: Could not establish session/credentials - {e}")
         sys.exit(1)
@@ -270,6 +306,14 @@ def main():
     print(f"Overall       : {overall}")
     print(f"CSV Report    : {csv_file}")
     print("=" * 60)
+
+    skipped_rows = [r for r in results if r["Status"] == "SKIPPED"]
+    if skipped_rows:
+        print("\nSKIPPED DETAILS:")
+        print("-" * 60)
+        for r in skipped_rows:
+            print(f"[{r['Region']}] {r['TrailName']}: {r['Evidence']}")
+        print("-" * 60)
 
 
 if __name__ == "__main__":
